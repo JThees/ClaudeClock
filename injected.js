@@ -17,7 +17,7 @@
     const ampm = hours >= 12 ? 'PM' : 'AM';
     hours = hours % 12 || 12; // Convert to 12-hour format
 
-    const humanReadable = `${hours}:${minutes} ${ampm} EST`;
+    const humanReadable = `${hours}:${minutes} ${ampm} ET`;
 
     return `[${now.toISOString()}] (${humanReadable})\n`;
   }
