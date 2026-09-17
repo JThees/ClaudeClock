@@ -1,160 +1,178 @@
-// ClaudeClock - Injected Script v2.0.0
-// This script runs in the page context to intercept fetch
+// ClaudeClock v3.0.0 — transport-agnostic, composer-aware timestamp injector
+//
+// Why v3: claude.ai / Cowork no longer sends your message as a plain JSON `fetch`
+// body with a `prompt`/`content` string (v2's assumption). The composer is a
+// TipTap/ProseMirror editor and the message leaves over whatever transport the
+// app likes (fetch, XHR, or a WebSocket). So instead of guessing the request
+// shape, v3:
+//   1. reads the text you actually typed, at the moment you hit send, and
+//   2. finds that exact text inside the outgoing payload — on fetch, XHR, OR
+//      WebSocket — and prepends the timestamp right there.
+// Never writes to the editor, never assumes a schema, and logs a "near-miss" if
+// it sees your text but can't place the stamp cleanly (so we can refine fast).
 
-(function() {
+(function () {
   'use strict';
+  const TAG = 'ClaudeClock:';
+  const log = (...a) => console.log(TAG, ...a);
+  log('v3.0.0 injected (composer-aware)');
 
-  // Function to get current timestamp
   function getTimestamp() {
     const now = new Date();
-
-    // Get EST time (UTC-5, or UTC-4 during DST)
-    const estTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-
-    // Format as hh:mm AM/PM
-    let hours = estTime.getHours();
-    const minutes = estTime.getMinutes().toString().padStart(2, '0');
-    const ampm = hours >= 12 ? 'PM' : 'AM';
-    hours = hours % 12 || 12; // Convert to 12-hour format
-
-    const humanReadable = `${hours}:${minutes} ${ampm} ET`;
-
-    return `[${now.toISOString()}] (${humanReadable})\n`;
+    const et = now.toLocaleString('en-US', {
+      timeZone: 'America/New_York', // Eastern — correct for Indianapolis
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    });
+    return `[${now.toISOString()}] (${et} ET)\n`;
   }
 
-  console.log('ClaudeClock v2.0.0: Injected script loaded');
+  const STAMPED = /^\[20\d\d-\d\d-\d\dT/; // already-timestamped guard
 
-  // Intercept fetch API
-  const originalFetch = window.fetch;
+  // ---- capture the user's message at send time -----------------------------
+  const COMPOSER_SEL =
+    '[data-composer-editor],.ProseMirror[contenteditable="true"],[role="textbox"][contenteditable="true"]';
 
-  window.fetch = async function(...args) {
-    let [url, options] = args;
+  let pending = null;      // { text, stamp, at }
+  let pendingTimer = null;
 
-    // Log all Claude-related requests
-    if (url && typeof url === 'string' && url.includes('/api/')) {
-      console.log('ClaudeClock: Intercepted request to:', url);
+  function readComposer() {
+    const el = document.querySelector(COMPOSER_SEL);
+    if (!el) return '';
+    return (el.innerText || '')
+      .replace(/ /g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/\s+$/, '')
+      .trim();
+  }
 
-      if (options && options.body) {
-        console.log('ClaudeClock: Request has body, attempting to parse...');
-        try {
-          const body = JSON.parse(options.body);
-          console.log('ClaudeClock: Parsed body:', body);
+  function capture(reason) {
+    const text = readComposer();
+    if (!text || STAMPED.test(text)) return;
+    pending = { text, stamp: getTimestamp(), at: Date.now() };
+    log('captured send (' + reason + '):',
+        JSON.stringify(text.slice(0, 60)) + (text.length > 60 ? '…' : ''));
+    clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(() => { pending = null; }, 15000);
+  }
 
-          // Prepend timestamp to user messages (Claude API format)
-          // Handle "prompt" field format
-          if (body.prompt && typeof body.prompt === 'string' && !body.prompt.startsWith('[20')) {
-            console.log('ClaudeClock: Adding timestamp to prompt');
-            body.prompt = getTimestamp() + body.prompt;
-            options.body = JSON.stringify(body);
-            console.log('ClaudeClock: Timestamp added to outgoing message');
-            console.log('ClaudeClock: Modified body:', body);
-          }
-          // Handle "messages" array format
-          else if (body.messages && Array.isArray(body.messages)) {
-            console.log('ClaudeClock: Found messages array with', body.messages.length, 'messages');
-            const lastMessage = body.messages[body.messages.length - 1];
-            if (lastMessage && lastMessage.role === 'user' && lastMessage.content) {
-              if (typeof lastMessage.content === 'string' && !lastMessage.content.startsWith('[20')) {
-                console.log('ClaudeClock: Adding timestamp to last user message');
-                lastMessage.content = getTimestamp() + lastMessage.content;
-                options.body = JSON.stringify(body);
-                console.log('ClaudeClock: Timestamp added to outgoing message');
-                console.log('ClaudeClock: Modified body:', body);
-              }
-            }
-          }
-        } catch (e) {
-          console.log('ClaudeClock: Could not parse request body', e);
+  // Enter (without Shift) inside the composer = send
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
+      const t = e.target;
+      if (t && t.closest && t.closest(COMPOSER_SEL)) capture('enter');
+    }
+  }, true);
+
+  // clicking any button while the composer has text = probably the send button
+  document.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest && e.target.closest('button,[role="button"]');
+    if (btn && readComposer()) capture('click');
+  }, true);
+
+  // ---- place the stamp wherever the text rides in the payload ---------------
+  function core(bodyStr) {
+    const T = pending.text;
+    const stamp = pending.stamp;
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    const tNorm = norm(T);
+
+    // structured JSON payloads (the common case)
+    try {
+      const obj = JSON.parse(bodyStr);
+      let hit = false;
+
+      // pass 1: a string value that IS the message
+      const exact = (node) => {
+        if (hit || node == null || typeof node !== 'object') return;
+        const entries = Array.isArray(node) ? node.map((v, i) => [i, v]) : Object.entries(node);
+        for (const [k, v] of entries) {
+          if (hit) return;
+          if (typeof v === 'string') {
+            if (!STAMPED.test(v) && (v === T || norm(v) === tNorm)) { node[k] = stamp + v; hit = true; return; }
+          } else { exact(v); }
         }
-      }
-    }
+      };
+      exact(obj);
 
-    // Get the response
-    const response = await originalFetch.apply(this, args);
-
-    // Intercept AI responses (streaming)
-    if (url && typeof url === 'string' && url.includes('/api/')) {
-      console.log('ClaudeClock: Checking response from:', url);
-      console.log('ClaudeClock: Content-Type:', response.headers.get('content-type'));
-
-      // For streaming responses, we need to intercept the stream
-      if (response.body && response.headers.get('content-type')?.includes('text/event-stream')) {
-        console.log('ClaudeClock: Found streaming response, intercepting...');
-        const originalBody = response.body;
-        const reader = originalBody.getReader();
-        const decoder = new TextDecoder();
-        let firstTextFound = false;
-        let chunkCount = 0;
-
-        const stream = new ReadableStream({
-          async start(controller) {
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                let chunk = decoder.decode(value, { stream: true });
-                chunkCount++;
-
-                // Log first 10 chunks to debug
-                if (chunkCount <= 10) {
-                  console.log(`ClaudeClock: Chunk ${chunkCount}:`, chunk);
-                }
-
-                // Inject timestamp into first text delta
-                // Claude SSE format: data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
-                if (!firstTextFound) {
-                  // Try multiple patterns to find the first text content
-                  const patterns = [
-                    // Standard text_delta pattern
-                    { regex: /"delta":\s*\{\s*"type"\s*:\s*"text_delta"\s*,\s*"text"\s*:\s*"([^"]*)"/, name: 'text_delta' },
-                    // Alternative ordering
-                    { regex: /"text"\s*:\s*"([^"]*)"\s*,\s*"type"\s*:\s*"text_delta"/, name: 'text_delta_alt' },
-                    // Direct text field
-                    { regex: /"text"\s*:\s*"([^"]+)"/, name: 'direct_text' },
-                    // Completion field
-                    { regex: /"completion"\s*:\s*"([^"]+)"/, name: 'completion' }
-                  ];
-
-                  for (let pattern of patterns) {
-                    const match = chunk.match(pattern.regex);
-                    if (match && match[1].length > 0) {
-                      const timestamp = getTimestamp();
-                      console.log(`ClaudeClock: Found first text using pattern '${pattern.name}', injecting timestamp`);
-                      console.log('ClaudeClock: Matched text:', match[1]);
-
-                      // Inject timestamp at the beginning of the text
-                      chunk = chunk.replace(pattern.regex, (fullMatch, capturedText) => {
-                        return fullMatch.replace(`"${capturedText}"`, `"${timestamp.replace(/\n/g, '\\n')}${capturedText}"`);
-                      });
-                      firstTextFound = true;
-                      console.log('ClaudeClock: Timestamp injected into AI response');
-                      console.log('ClaudeClock: Modified chunk:', chunk);
-                      break;
-                    }
-                  }
-                }
-
-                controller.enqueue(new TextEncoder().encode(chunk));
-              }
-              controller.close();
-            } catch (e) {
-              console.error('ClaudeClock: Stream error:', e);
-              controller.error(e);
-            }
+      // pass 2 (fallback): first ProseMirror text leaf that begins the message
+      if (!hit) {
+        const leaf = (node) => {
+          if (hit || node == null || typeof node !== 'object') return;
+          if (node.type === 'text' && typeof node.text === 'string' &&
+              !STAMPED.test(node.text) && T.startsWith(node.text)) {
+            node.text = stamp + node.text; hit = true; return;
           }
-        });
+          const entries = Array.isArray(node) ? node : Object.values(node);
+          for (const v of entries) { if (hit) return; if (v && typeof v === 'object') leaf(v); }
+        };
+        leaf(obj);
+      }
 
-        return new Response(stream, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers
-        });
+      if (hit) { pending = null; return JSON.stringify(obj); }
+      return bodyStr;
+    } catch (_) {
+      // raw string payload containing the message verbatim
+      const i = bodyStr.indexOf(T);
+      if (i !== -1 && !STAMPED.test(bodyStr.slice(i, i + 12))) {
+        pending = null; return bodyStr.slice(0, i) + stamp + bodyStr.slice(i);
+      }
+      // message sits inside a larger string as a JSON-escaped chunk
+      const escT = JSON.stringify(T).slice(1, -1);
+      const j = bodyStr.indexOf(escT);
+      if (j !== -1) {
+        const escStamp = JSON.stringify(stamp).slice(1, -1);
+        pending = null; return bodyStr.slice(0, j) + escStamp + bodyStr.slice(j);
+      }
+      return bodyStr;
+    }
+  }
+
+  function inject(transport, bodyStr) {
+    if (!pending || typeof bodyStr !== 'string' || !bodyStr) return bodyStr;
+    const out = core(bodyStr);
+    if (out !== bodyStr) { log('stamped outgoing message via', transport); return out; }
+    // diagnostics: text is present but we couldn't place the stamp cleanly
+    if (pending && bodyStr.length < 300000) {
+      const probe = pending.text.slice(0, 12);
+      const at = bodyStr.indexOf(probe);
+      if (at !== -1) {
+        log('near-miss in', transport, '— your text is in this payload but unmatched. Context:',
+            JSON.stringify(bodyStr.slice(Math.max(0, at - 60), at + 140)));
       }
     }
+    return bodyStr;
+  }
 
-    return response;
+  // fetch
+  const _fetch = window.fetch;
+  window.fetch = function (input, init) {
+    try {
+      if (pending && init && typeof init.body === 'string') {
+        init = Object.assign({}, init, { body: inject('fetch', init.body) });
+      }
+    } catch (e) { log('fetch hook error', e); }
+    return _fetch.call(this, input, init);
   };
 
-  console.log('ClaudeClock: Fetch interceptor installed in page context');
+  // XMLHttpRequest
+  const _open = XMLHttpRequest.prototype.open;
+  const _send = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (m, u) { this.__ccUrl = u; return _open.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function (body) {
+    try { if (pending && typeof body === 'string') body = inject('xhr', body); }
+    catch (e) { log('xhr hook error', e); }
+    return _send.call(this, body);
+  };
+
+  // WebSocket
+  const _wsSend = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    try { if (pending && typeof data === 'string') data = inject('websocket', data); }
+    catch (e) { log('ws hook error', e); }
+    return _wsSend.call(this, data);
+  };
+
+  log('hooks installed: fetch + XMLHttpRequest + WebSocket');
 })();

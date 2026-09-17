@@ -1,152 +1,70 @@
-# GhostClock - ChatGPT Timestamp Extension
+# ClaudeClock
 
-A browser extension that automatically prepends timestamps to both user messages and AI responses in ChatGPT conversations, ensuring temporal context is always included.
+A small Chrome (Manifest V3) extension that prepends a timestamp to the messages
+you send on **claude.ai — including Cowork** — so Claude actually knows the current
+date and time instead of guessing.
 
-## Features
+## Why
 
-- **Dual Timestamp Injection**: Timestamps both your messages and ChatGPT's responses
-- **ISO 8601 Format**: `[2025-10-01T12:34:56.789Z]` for machine readability
-- **Human-Readable Time**: `(8:30 PM EST)` appended for easy reading
-- **Line Break**: Timestamps appear on their own line for clean formatting
-- **API-Level Interception**: Works by intercepting fetch calls, not DOM manipulation
-- **Non-intrusive**: Runs silently in the background
-- **Compatible**: Works with chatgpt.com and chat.openai.com
+Claude has no reliable sense of wall-clock time between turns, and when it doesn't
+know the time it will happily *confabulate* one. ClaudeClock stamps each outgoing
+message with an ISO timestamp plus a human-readable Eastern-time string, e.g.:
 
-## Installation
-
-### Chrome/Edge/Brave
-
-1. Download or clone this repository
-2. Open your browser and navigate to:
-   - Chrome: `chrome://extensions/`
-   - Edge: `edge://extensions/`
-   - Brave: `brave://extensions/`
-
-3. Enable "Developer mode" (toggle in top-right corner)
-
-4. Click "Load unpacked"
-
-5. Select the `GhostClock` folder
-
-6. The extension is now active on ChatGPT!
-
-### Firefox
-
-1. Download or clone this repository
-
-2. Open Firefox and navigate to: `about:debugging#/runtime/this-firefox`
-
-3. Click "Load Temporary Add-on"
-
-4. Navigate to the `GhostClock` folder and select `manifest.json`
-
-5. The extension is now active on ChatGPT!
-
-**Note**: In Firefox, temporary extensions are removed when you close the browser. For permanent installation, you'll need to sign the extension through Firefox Add-ons.
-
-## Usage
-
-1. Navigate to [ChatGPT](https://chatgpt.com) or [chat.openai.com](https://chat.openai.com)
-
-2. Type your message as normal
-
-3. Press Enter or click the send button
-
-4. The extension automatically prepends timestamps to both your messages and AI responses
-
-Example:
 ```
-Your input: "What's the weather like?"
-
-Sent to ChatGPT:
-[2025-10-01T15:30:45.123Z] (3:30 PM EST)
-What's the weather like?
-
-ChatGPT's response:
-[2025-10-01T15:30:47.456Z] (3:30 PM EST)
-I don't have access to real-time weather data...
+[2026-09-17T19:42:30.693Z] (3:42 PM ET)
+your message here
 ```
 
-## How It Works
+That line rides along with your message, so Claude sees exactly when you sent it.
 
-The extension uses a two-script injection pattern to intercept ChatGPT's API communication:
+## Install (unpacked)
 
-1. **Content Script** (`content.js`): Injects the interceptor script into the page context
+1. Clone or download this repo.
+2. Open `chrome://extensions` and enable **Developer mode**.
+3. **Load unpacked** → select this folder.
+4. After any update: click the extension's **reload (↻)**, then **refresh** any open
+   claude.ai tab (content scripts only inject on page load, so an open tab keeps
+   running the old script until you refresh it).
 
-2. **Injected Script** (`injected.js`): Runs in the page context to intercept `fetch()` API calls
+## How it works (v3)
 
-3. **User Message Interception**: Modifies outgoing requests to ChatGPT's API, prepending timestamps to the `content.parts[]` array in user messages
+Earlier versions overrode `window.fetch` and edited the request body, assuming the
+message rode in a `prompt` or `messages[].content` **string**. Cowork broke that
+assumption: it sends your message over a different transport (XHR and/or WebSocket)
+in a different shape, so a fetch-only, schema-specific hook never saw the text.
 
-4. **AI Response Interception**: Intercepts Server-Sent Event (SSE) streaming responses and injects timestamps into the first text delta (`{"v": "text"}`)
+v3 is **transport- and schema-agnostic**:
 
-This approach works at the API level rather than DOM manipulation, ensuring compatibility even as ChatGPT's interface changes.
+1. It watches the composer (a TipTap/ProseMirror `contenteditable`) and, the moment
+   you send (Enter, or a send-button click), captures the exact text you typed plus
+   a timestamp. It never writes back into the editor.
+2. It hooks `fetch`, `XMLHttpRequest.prototype.send`, **and**
+   `WebSocket.prototype.send`. While a send is pending, it finds your captured text
+   inside the outgoing payload — by JSON value-match, ProseMirror text-node
+   fallback, raw substring, or JSON-escaped substring — and prepends the timestamp
+   right there.
+3. If it ever sees your text but can't place the stamp, it logs a `near-miss` with
+   surrounding context, so adapting to a new payload shape is a one-line change.
 
-## Privacy
+See [`INJECTION.md`](./INJECTION.md) for the technical detail.
 
-- All processing happens locally in your browser
-- No data is sent to external servers
-- No data collection or tracking
-- Open source - inspect the code yourself
+## Timezone
 
-## Icons
+Timestamps render in US Eastern (`America/New_York`), which matches Indianapolis.
+Change the `timeZone` in `getTimestamp()` inside `injected.js` for a different zone.
 
-The extension includes custom icons (black background with teal analog clock):
-- `icon16.png` - 16x16 pixels (toolbar)
-- `icon48.png` - 48x48 pixels (extensions page)
-- `icon128.png` - 128x128 pixels (Chrome Web Store)
+## Files
 
-SVG source files are also included if you want to customize the design. Use `generate-icons.html` to convert SVG to PNG.
+| File | Role |
+| --- | --- |
+| `manifest.json` | MV3 manifest; host `https://claude.ai/*` |
+| `content.js` | Content script (isolated world); injects `injected.js` into the page |
+| `injected.js` | The capture + injection logic; runs in page context to hook fetch/XHR/WebSocket |
 
-## Troubleshooting
+## History & durability
 
-**Timestamps not appearing?**
-- Refresh the ChatGPT page after installing the extension
-- Check that the extension is enabled in your browser's extension manager
-- Open browser console (F12) and look for "GhostClock v2.0.0: Injected script loaded" message
-- Verify you see "GhostClock: Timestamp added to outgoing message" when sending messages
-
-**Extension not loading?**
-- Ensure all files are in the same folder (`manifest.json`, `content.js`, `injected.js`, icon files)
-- Check browser console for errors
-- Verify you're using a Chromium-based browser (Chrome/Edge/Brave) or Firefox
-- Try completely removing and reinstalling the extension
-
-**Extension updates not loading?**
-- Chrome aggressively caches extension files
-- Click "Reload" on the extension card in chrome://extensions/
-- If that doesn't work, completely remove and reinstall the extension
-- Close and reopen your browser
-
-## Uninstallation
-
-1. Navigate to your browser's extensions page
-2. Find "GhostClock - ChatGPT Timestamp"
-3. Click "Remove"
-
-## Technical Details
-
-**Version**: 2.0.0
-
-**Files**:
-- `manifest.json` - Extension manifest (Manifest V3)
-- `content.js` - Content script that injects the interceptor
-- `injected.js` - Main script that intercepts fetch API
-- `icon16.png`, `icon48.png`, `icon128.png` - Extension icons
-- `icon16.svg`, `icon48.svg`, `icon128.svg` - SVG source files
-- `generate-icons.html` - SVG to PNG converter
-
-**Timestamp Format**:
-```
-[2025-10-01T15:30:45.123Z] (3:30 PM EST)
-```
-- ISO 8601 timestamp for machine parsing
-- 12-hour EST time for human readability
-- Line break after timestamp
-
-## License
-
-MIT License - Feel free to modify and distribute
-
-## Contributing
-
-Issues and pull requests welcome!
+Descended from **GhostClock** (originally a ChatGPT tool), ported to Claude as
+**ClaudeClock**, and rewritten as **v3** for the Cowork / ProseMirror era. It is
+known to be *finite*: it rides on the app's current front-end, so a large enough
+UI refactor will eventually need another pass. v3 is built to make that pass small —
+the `near-miss` log points straight at whatever changed.
