@@ -1,101 +1,100 @@
-# ClaudeClock — Injection Technical Notes (v3)
+# ClaudeClock — Injection Technical Notes (v3.3)
 
 How ClaudeClock gets a timestamp onto your outgoing message in claude.ai / Cowork.
 
-## The problem with the old approach
+## The problem with the old approaches
 
-v2 overrode `window.fetch`, parsed the request body as JSON, and prepended the
-timestamp to `body.prompt` (a string) or `body.messages[last].content` (a string).
-That worked on the older chat API, where the message text rode in the POST body.
+**v2** overrode `window.fetch`, parsed the request body as JSON, and prepended the
+timestamp to `body.prompt` or `body.messages[last].content` (both strings). That
+worked on the older chat API, where the message text rode in a plain-string POST
+body. It stopped working in Cowork: the only readable `fetch` bodies were things
+like `{ "message_ids": [...] }` (a reference by ID, no text), so a fetch-only,
+schema-specific hook was structurally blind to the message.
 
-It stopped working in **Cowork**. Watching the traffic during a send showed the only
-JSON `fetch` bodies were things like:
+**v3.0** decoupled the two halves — capture at the composer, inject at the
+transport — and hooked `fetch` + `XHR` + `WebSocket`, scanning each outgoing
+**string** payload for the captured text. Right idea, but it still assumed the
+text would appear as a *string* somewhere. It didn't, and the failure was silent.
 
-```
-{ "message_ids": ["msg_011Cf9WDYZ..."] }   // a message referenced by ID — no text
-```
+## What the v3.1→v3.3 instrumentation found
 
-plus a multipart `FormData` upload (`cowork/attachments`). The user's typed text
-never appeared in a `fetch` body the hook could parse. Cowork ships the message over
-a different transport (XHR and/or WebSocket) and/or a different shape, so a
-fetch-only, schema-specific hook is structurally blind to it.
+The v3.0 miss was silent because it neither stamped nor logged a near-miss, so
+v3.1–v3.2 added instrumentation to make the invisible visible:
 
-## The v3 approach: capture at the composer, inject at the transport
+- **v3.1** taught the fetch hook to also read **Request-object** bodies and
+  **non-string** bodies, and to log the URL + body-shape of every outgoing request
+  while a send is pending. Result: the send is a single `fetch` to
+  `/…/completion` (`mode=legacy`) whose body is a **`Uint8Array` (~40 KB)** — not a
+  string, not a Request. (That ruled out the "other transport" theory entirely.)
+- **v3.2** added a `PEEK` for a decoded-but-unmatched non-string body: char length,
+  a **printable-character ratio**, presence checks, and **magic-byte sniffing**.
+  It printed: `magic: gzip (1f 8b) · decoded 38242 chars · ~40% printable · text
+  present? raw=false`. That settled it — the body is **gzip-compressed JSON**.
+  Every prior version decoded the gzip bytes as UTF-8, got mojibake, and so never
+  found the text.
+
+## The v3.3 approach: capture at the composer, gzip round-trip at the transport
 
 Two decoupled halves.
 
 ### 1. Capture (what you typed)
 
-The composer is a TipTap/ProseMirror `contenteditable` div. Selectors:
-
-```
-[data-composer-editor]
-.ProseMirror[contenteditable="true"]
-[role="textbox"][contenteditable="true"]
-```
-
-(aria-label "Write your prompt to Claude"). There is **no** plain send `<button>`
-exposing a "send" label; sending is Enter-driven.
-
-On `keydown` Enter (no Shift/modifier) inside the composer — or any
-`button`/`[role="button"]` click while the composer has text — v3 reads
-`composer.innerText`, normalizes whitespace, and stores `pending = { text, stamp }`
-with a 15-second expiry. It deliberately **never writes back into ProseMirror**;
-doing so would mean fighting the editor's internal document model and dispatching
-synthetic input events. Reading is safe and stable; writing is not.
+The composer is a TipTap/ProseMirror `contenteditable` div. On `keydown` Enter
+(no Shift/modifier) inside it — or any `button`/`[role="button"]` click while it
+has text — v3 reads `composer.innerText`, normalizes whitespace, and stores
+`pending = { text, stamp }` with a 15-second expiry. It **never writes back into
+ProseMirror** (that would mean fighting the editor's document model). Reading is
+safe and stable; writing is not.
 
 ### 2. Inject (into the outgoing payload)
 
-v3 wraps all three outgoing transports:
+While a send is `pending`, the fetch hook inspects the outgoing body:
 
-- `window.fetch`
-- `XMLHttpRequest.prototype.send`
-- `WebSocket.prototype.send`
+1. **gzip body (the live path)** — if the bytes start with `1f 8b`, inflate with
+   the browser-native `DecompressionStream('gzip')`, run the JSON matcher on the
+   result, re-compress with `CompressionStream('gzip')`, and send the fresh bytes.
+   `Content-Encoding` stays `gzip`; the browser recomputes `Content-Length`.
+2. **plain string body** — scan and prepend directly (v3.0 fast path).
+3. **Request-object / other non-string bodies** — read as text (or inflate if
+   gzip) and scan; rebuild the request if changed.
 
-While a send is `pending`, each outgoing **string** payload is scanned for the
-captured text; if found, the timestamp is prepended in place:
+The JSON matcher itself: `JSON.parse` the (inflated) body, walk it, find the first
+string value equal to the captured text (exact or whitespace-normalized) and
+prepend the stamp; fall back to the first ProseMirror `{ "type":"text", ... }` leaf
+that begins the message; fall back again to raw / JSON-escaped substring matches.
+On a hit, `pending` clears so later frames aren't double-stamped, and a
+`^\[20\d\d-\d\d-\d\dT` guard prevents re-stamping.
 
-1. **Structured JSON** — `JSON.parse` the body, walk it, find the first string value
-   equal to the captured text (exact, or whitespace-normalized) and prepend. Fallback
-   for ProseMirror-doc payloads: the first `{ "type": "text", "text": "..." }` leaf
-   that *begins* the message.
-2. **Raw string** — prepend at the first occurrence of the captured text.
-3. **JSON-escaped** — if the text sits inside a larger string with escaped
-   newlines/quotes, match and prepend the escaped forms.
+## Diagnostics
 
-On a hit, `pending` is cleared so later frames of the same send aren't double-stamped.
-A `^\[20\d\d-\d\d-\d\dT` guard prevents re-stamping already-stamped text.
+The release build ships with `DEBUG = false` (top of `injected.js`) — a quiet
+console with one `stamped outgoing message via …` line per message, loud only on
+real failure. Flip `DEBUG = true`, reload, and refresh to get the full forensic
+trace that found the gzip layer: per-send request shapes, `PEEK` of decoded
+bodies (with printable-ratio + magic sniff), `near-miss` context, and re-gzip byte
+counts. That trace is the thing that makes the *next* breakage a small, targeted
+edit instead of another blind hunt.
 
-### Diagnostics
-
-If a payload contains the captured text but no rule matched, v3 logs:
-
-```
-ClaudeClock: near-miss in <transport> — your text is in this payload but unmatched. Context: "..."
-```
-
-That prints the surrounding bytes, so adapting to a new shape is a small, targeted edit.
-
-Normal successful run logs:
+Normal successful run (DEBUG off):
 
 ```
-ClaudeClock: v3.0.0 injected (composer-aware)
-ClaudeClock: hooks installed: fetch + XMLHttpRequest + WebSocket
-ClaudeClock: captured send (enter): "..."
-ClaudeClock: stamped outgoing message via <transport>
+ClaudeClock: v3.3.0 injected
+ClaudeClock: stamped outgoing message via fetch(gzip)
 ```
 
-## Why this is more durable than v2
+## Why this is durable
 
-It depends on **no** endpoint URL, request schema, or transport. As long as (a) the
-composer is findable and (b) your text appears somewhere in the outgoing bytes, it
-works. Only a refactor that changes *both* of those breaks it — and the `near-miss`
-log points straight at the new shape when it happens.
+It depends on **no** endpoint URL or fixed request schema, and it now handles the
+compression layer. As long as (a) the composer is findable and (b) your text
+appears somewhere in the outgoing bytes after decompression, it works. If a future
+refactor changes the shape again, `DEBUG = true` points straight at it.
 
 ## Known limits
 
 - Still finite — it rides the live front-end.
-- Binary / `FormData`-only sends are not handled (the payload must be a string).
+- Handles gzip; **zstd/brotli/deflate** would need their own decode paths (the
+  magic sniffer already names them if they ever appear).
+- `FormData`/binary-only sends with no text payload are still out of scope.
 - On a multi-frame send, only the first matching frame is stamped (intended).
 
 ## Timestamp format

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ClaudeClock - Claude Timestamp",
-  "version": "3.0.0",
+  "version": "3.3.0",
   "description": "Automatically prepends timestamps to Claude messages",
   "permissions": [
     "activeTab",

@@ -1,8 +1,8 @@
-// ClaudeClock - Content Script v2.0.0
-// This script injects the actual interceptor into the page
+// ClaudeClock - Content Script v3.3.0
+// This script injects the actual interceptor into the page context.
 
 (function() {
-  console.log('ClaudeClock v2.0.0: Content script loaded');
+  console.log('ClaudeClock v3.3.0: Content script loaded');
 
   // Inject the script into the page context
   const script = document.createElement('script');
@@ -13,5 +13,5 @@
   };
   (document.head || document.documentElement).appendChild(script);
 
-  console.log('ClaudeClock v2.0.0: Injection complete');
+  console.log('ClaudeClock v3.3.0: Injection complete');
 })();
